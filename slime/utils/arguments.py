@@ -328,8 +328,108 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Path to the buffer filter function. "
                     "It should be able to select the samples in the buffer. "
-                    "The function should take list[list[Sample]] and return list[list[Sample]]."
+                    "The function should take list[list[Sample]] and return list[list[Sample]]. "
+                    "DEPRECATED: Use --buffer-sampling-strategy instead for better control."
                 ),
+            )
+
+            # === NEW: Buffer Sampling Strategy Configuration ===
+            parser.add_argument(
+                "--buffer-sampling-strategy",
+                type=str,
+                choices=["fifo_staleness", "priority", "random", "reservoir", "custom"],
+                default="fifo_staleness",
+                help=(
+                    "Buffer sampling strategy: "
+                    "'fifo_staleness': FIFO with staleness filtering (DEFAULT, recommended for most cases); "
+                    "'priority': Priority-based sampling using reward/advantage metrics; "
+                    "'random': Random sampling with staleness filtering; "
+                    "'reservoir': Reservoir sampling for uniform distribution; "
+                    "'custom': Custom strategy (requires --buffer-sampling-custom-path)"
+                ),
+            )
+
+            parser.add_argument(
+                "--buffer-sampling-custom-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to custom sampling strategy class (only used when buffer_sampling_strategy=custom). "
+                    "Should be a subclass of BaseSamplingStrategy. "
+                    "Example: 'my_module.MyCustomStrategy'"
+                ),
+            )
+
+            parser.add_argument(
+                "--buffer-remove-on-sample",
+                type=lambda x: x.lower() in ["true", "1", "yes"],
+                default=True,
+                help=(
+                    "Whether to remove samples from buffer after sampling. "
+                    "If False, samples can be reused (controlled by --buffer-reuse-samples). "
+                    "Default: True (each sample used once)."
+                ),
+            )
+
+            parser.add_argument(
+                "--buffer-reuse-samples",
+                type=int,
+                default=1,
+                help=(
+                    "Maximum times a sample can be reused (only effective when --buffer-remove-on-sample=False). "
+                    "0 means unlimited reuse. "
+                    "Default: 1 (no reuse, equivalent to remove-on-sample=True)"
+                ),
+            )
+
+            # === Priority Sampling Configuration ===
+            parser.add_argument(
+                "--buffer-priority-metric",
+                type=str,
+                choices=["reward", "advantage", "custom"],
+                default="reward",
+                help=(
+                    "Metric for priority sampling (only used when buffer_sampling_strategy=priority): "
+                    "'reward': Sample based on reward values; "
+                    "'advantage': Sample based on advantage values (requires pre-computation); "
+                    "'custom': Custom metric (requires --buffer-priority-custom-path)"
+                ),
+            )
+
+            parser.add_argument(
+                "--buffer-priority-custom-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to custom priority metric function (only used when buffer_priority_metric=custom). "
+                    "Function signature: def metric(group: List[Sample]) -> float"
+                ),
+            )
+
+            parser.add_argument(
+                "--buffer-priority-weight",
+                type=float,
+                default=1.0,
+                help="Weight for priority metric in scoring (only for priority sampling). Default: 1.0",
+            )
+
+            parser.add_argument(
+                "--buffer-staleness-penalty",
+                type=float,
+                default=0.1,
+                help=(
+                    "Staleness penalty coefficient for priority sampling. "
+                    "Score = reward × priority_weight - staleness × staleness_penalty. "
+                    "Default: 0.1"
+                ),
+            )
+
+            # === Random Sampling Configuration ===
+            parser.add_argument(
+                "--buffer-random-seed",
+                type=int,
+                default=None,
+                help="Random seed for random/reservoir sampling strategies. Default: None (non-deterministic)",
             )
             # update weight
             parser.add_argument(
@@ -658,11 +758,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft_loss", "custom_loss"],
+                choices=["policy_loss", "decoupled_policy_loss", "value_loss", "sft_loss", "custom_loss"],
                 default="policy_loss",
                 help=(
-                    "Choose loss type, currently support ppo policy_loss or sft_loss, "
-                    "if custom_loss is set, we will use the function path from `--custom-loss-function-path`."
+                    "Choose loss type: "
+                    "'policy_loss': standard PPO/GRPO policy loss (default), "
+                    "'decoupled_policy_loss': off-policy GRPO with decoupled PPO objective (AREAL-style), "
+                    "'value_loss': critic network value loss, "
+                    "'sft_loss': supervised fine-tuning loss, "
+                    "'custom_loss': user-defined custom loss (set path via --custom-loss-function-path)."
                 ),
             )
             parser.add_argument(
@@ -777,6 +881,119 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help="Path to the custom TIS function.",
+            )
+
+            # === Off-Policy GRPO Parameters ===
+            parser.add_argument(
+                "--max-staleness",
+                type=int,
+                default=-1,
+                help=(
+                    "Maximum allowed staleness (η) for off-policy training. "
+                    "Enforces: ⌊(N_r - 1) / B⌋ ≤ i + η where N_r is number of generated trajectories, "
+                    "B is batch size, i is current policy version. "
+                    "Set to -1 to disable staleness control (unlimited staleness). "
+                    "Set to 0 for synchronous on-policy training. "
+                    "Recommended: 2-5 for moderate off-policy training."
+                ),
+            )
+            parser.add_argument(
+                "--importance-weight-clip-min",
+                type=float,
+                default=None,
+                help=(
+                    "Minimum clipping value for importance weights π_prox/π_behav. "
+                    "Helps prevent extreme importance weights from destabilizing training. "
+                    "Recommended: 0.1 to 0.5 if used."
+                ),
+            )
+            parser.add_argument(
+                "--importance-weight-clip-max",
+                type=float,
+                default=None,
+                help=(
+                    "Maximum clipping value for importance weights π_prox/π_behav. "
+                    "Helps prevent extreme importance weights from destabilizing training. "
+                    "Recommended: 2.0 to 10.0 if used."
+                ),
+            )
+            # === Buffer Configuration ===
+            parser.add_argument(
+                "--buffer-mode",
+                type=str,
+                choices=["in_process", "http", "none"],
+                default="in_process",
+                help=(
+                    "Buffer implementation mode: "
+                    "'in_process': Fast embedded buffer (default, ~0.1ms latency), suitable for standard GRPO/PPO; "
+                    "'http': HTTP-based buffer server (~10ms latency), for agent tasks and async generation; "
+                    "'none': No buffer (read-only), for on-policy training without replay."
+                ),
+            )
+            parser.add_argument(
+                "--use-buffer",
+                type=lambda x: x.lower() in ["true", "1", "yes"],
+                default=None,
+                help=(
+                    "Explicitly enable or disable buffer. "
+                    "If not set, automatically enabled for off-policy (loss_type=decoupled_policy_loss) "
+                    "and disabled for on-policy (loss_type=policy_loss)."
+                ),
+            )
+            parser.add_argument(
+                "--buffer-max-size",
+                type=int,
+                default=1000,
+                help=(
+                    "Maximum buffer capacity (number of sample groups). "
+                    "When buffer is full, oldest samples are evicted (FIFO). "
+                    "Larger buffer provides more diverse data but uses more memory."
+                ),
+            )
+
+            # === HTTP Buffer Configuration (only for --buffer-mode http) ===
+            parser.add_argument(
+                "--buffer-server-url",
+                type=str,
+                default="http://localhost:8889",
+                help=(
+                    "URL of the HTTP buffer server (only used when buffer_mode=http). "
+                    "Start the server first: cd slime_plugins/rollout_buffer && python buffer.py"
+                ),
+            )
+            parser.add_argument(
+                "--buffer-task-type",
+                type=str,
+                default="grpo",
+                help=(
+                    "Task type for HTTP buffer generator (only used when buffer_mode=http). "
+                    "Options: 'grpo' (standard GRPO), 'math', 'tool', or custom task types. "
+                    "Custom generators should be placed in slime_plugins/rollout_buffer/generator/"
+                ),
+            )
+            parser.add_argument(
+                "--buffer-timeout",
+                type=int,
+                default=30,
+                help="HTTP buffer request timeout in seconds (only used when buffer_mode=http).",
+            )
+            parser.add_argument(
+                "--buffer-max-retries",
+                type=int,
+                default=3,
+                help="Maximum HTTP buffer request retries (only used when buffer_mode=http).",
+            )
+
+            parser.add_argument(
+                "--enable-proximal-policy-storage",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable storing proximal policy parameters for decoupled PPO. "
+                    "When enabled, saves model parameters before each gradient update "
+                    "to use as proximal policy in the next training step. "
+                    "Automatically enabled when using decoupled_policy_loss."
+                ),
             )
 
             parser.add_argument(

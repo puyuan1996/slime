@@ -12,7 +12,7 @@ import wandb
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
-from slime.ray.rollout_data_source import RolloutDataSourceWithBuffer
+from slime.ray.rollout_data_source_factory import create_rollout_data_source
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import find_available_port, get_host_info, init_http_client
@@ -45,7 +45,8 @@ class RolloutManager:
         )
         init_http_client(args)
 
-        self.data_source = RolloutDataSourceWithBuffer(args)
+        # === Create data source using factory (supports in_process/http/none) ===
+        self.data_source = create_rollout_data_source(args)
 
         self.generate_rollout = load_function(self.args.rollout_function_path)
         self.eval_generate_rollout = load_function(self.args.eval_function_path)
@@ -54,6 +55,21 @@ class RolloutManager:
             self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
         print(f"import {self.args.rollout_function_path} as generate_rollout function.")
         print(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
+
+        # === Off-Policy tracking ===
+        self.current_policy_version = 0
+
+        # === Staleness Control ===
+        if args.max_staleness >= 0:
+            from slime.utils.offpolicy_utils import StalenessController
+            self.staleness_controller = StalenessController(
+                max_staleness=args.max_staleness,
+                batch_size=args.rollout_batch_size * args.n_samples_per_prompt,
+            )
+            print(f"[Staleness Control] Initialized with max_staleness={args.max_staleness}, batch_size={args.rollout_batch_size * args.n_samples_per_prompt}")
+        else:
+            self.staleness_controller = None
+            print("[Staleness Control] Disabled (max_staleness < 0)")
 
         if self.args.debug_train_only:
             self.all_rollout_engines = []
@@ -87,14 +103,65 @@ class RolloutManager:
         return len(self.data_source.dataset) // self.args.rollout_batch_size
 
     def generate(self, rollout_id):
+        # === Check staleness budget before generation ===
+        if self.staleness_controller is not None:
+            if not self.staleness_controller.can_submit_request():
+                print(
+                    f"[Staleness Control] WARNING: Rollout {rollout_id} would exceed staleness budget "
+                    f"(num_generated={self.staleness_controller.num_generated}, "
+                    f"policy_version={self.staleness_controller.current_policy_version}, "
+                    f"max_staleness={self.staleness_controller.max_staleness}). "
+                    f"Proceeding anyway, but this may degrade off-policy performance."
+                )
+
         monitor_started = self.args.use_fault_tolerance and self._health_monitor.start()
         start_time = time.time()
         try:
+            # === Step 1: Generate new rollout data ===
             data, metrics = self._get_rollout_data(rollout_id=rollout_id)
             self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
             _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
-            data = self._convert_samples_to_train_data(data)
-            return Box(ray.put(data))
+
+            # === Step 2: Add to buffer (automatic based on buffer_enabled) ===
+            # data is list[Sample] (flattened), add_samples will auto-group it
+            self.data_source.add_samples(data)
+
+            # === Step 3: Log buffer stats ===
+            buffer_stats = self.data_source.get_buffer_stats()
+            if buffer_stats["enabled"]:
+                print(f"[Buffer] Added {len(data)} samples. Stats: {buffer_stats}")
+                # Optional: log to wandb
+                if wandb.run is not None:
+                    wandb.log({
+                        "buffer/size": buffer_stats["buffer_size"],
+                        "buffer/utilization": buffer_stats["buffer_utilization"],
+                        "rollout_id": rollout_id,
+                    })
+
+            # === Step 4: Sample data for training (mixes buffer + new data automatically) ===
+            # get_samples returns list[list[Sample]] (grouped)
+            train_data_samples = self.data_source.get_samples(
+                num_samples=self.args.rollout_batch_size
+            )
+
+            # === Step 5: Flatten grouped samples for _convert_samples_to_train_data ===
+            # _convert_samples_to_train_data expects list[Sample], not list[list[Sample]]
+            if len(train_data_samples) > 0 and isinstance(train_data_samples[0], list):
+                # Flatten: list[list[Sample]] -> list[Sample]
+                flattened_samples = []
+                for group in train_data_samples:
+                    flattened_samples.extend(group)
+                train_data_samples = flattened_samples
+
+            # === Step 6: Convert to training format ===
+            train_data = self._convert_samples_to_train_data(train_data_samples)
+
+            # === Step 7: Record generated batch in staleness controller ===
+            if self.staleness_controller is not None:
+                num_samples = len(train_data["tokens"])
+                self.staleness_controller.on_generation_completed(num_samples)
+
+            return Box(ray.put(train_data))
         finally:
             if monitor_started:
                 self._health_monitor.stop()
@@ -155,7 +222,30 @@ class RolloutManager:
                 origin_data_length = len(data)
                 data = data[:trim_len]
                 print(f"trim number of samples from {origin_data_length} to {trim_len}")
+
+        # === Tag samples with current policy version ===
+        # Always set policy_version for all samples (both normal and debug data)
+        for sample in data:
+            sample.policy_version = self.current_policy_version
+
         return data, metrics
+
+    def on_policy_update(self):
+        """Called after training completes to increment policy version."""
+        self.current_policy_version += 1
+        print(f"[Off-Policy Tracking] Policy version updated to {self.current_policy_version}")
+
+        # === Update data source policy version (for staleness-aware sampling) ===
+        if hasattr(self.data_source, 'update_policy_version'):
+            self.data_source.update_policy_version(self.current_policy_version)
+
+        # === Update staleness controller ===
+        if self.staleness_controller is not None:
+            self.staleness_controller.on_training_step()
+            print(
+                f"[Staleness Control] Updated - num_generated={self.staleness_controller.num_generated}, "
+                f"policy_version={self.staleness_controller.current_policy_version}"
+            )
 
     def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
         # TODO to be refactored (originally Buffer._set_data)
@@ -256,6 +346,15 @@ class RolloutManager:
 
         if "teacher_log_probs" in samples[0].__dict__:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+
+        # === Add policy versions for off-policy tracking ===
+        if samples[0].policy_version is not None:
+            train_data["policy_versions"] = [sample.policy_version for sample in samples]
+        elif hasattr(self.args, "loss_type") and self.args.loss_type == "decoupled_policy_loss":
+            # For off-policy GRPO, policy_version should always be set
+            # If it's None, use 0 as default (should not happen in normal flow)
+            print(f"[WARNING] policy_version is None for off-policy GRPO, using default value 0")
+            train_data["policy_versions"] = [0] * len(samples)
 
         return train_data
 
