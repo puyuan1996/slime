@@ -285,13 +285,28 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             # Update statistics
             self.total_sampled += len(samples)
 
-            # Log sampling info
+            # Log sampling info with staleness monitoring
             if len(samples) > 0:
                 versions = [s[0].policy_version for s in samples if s[0].policy_version is not None]
                 if versions:
-                    print(f"[Buffer Sampling] Sampled {len(samples)} groups. "
-                          f"Version range: [{min(versions)}, {max(versions)}], "
-                          f"Current version: {self.current_policy_version}")
+                    # Calculate staleness for each sampled group
+                    staleness_values = [
+                        self.current_policy_version - s[0].policy_version 
+                        for s in samples 
+                        if s[0].policy_version is not None
+                    ]
+                    
+                    if staleness_values:
+                        max_allowed = self.sampling_strategy.max_staleness if hasattr(self.sampling_strategy, 'max_staleness') else -1
+                        print(f"[Buffer Sampling] Sampled {len(samples)} groups. "
+                              f"Version range: [{min(versions)}, {max(versions)}], "
+                              f"Current version: {self.current_policy_version}, "
+                              f"Staleness range: [{min(staleness_values)}, {max(staleness_values)}], "
+                              f"max_allowed={max_allowed}")
+                    else:
+                        print(f"[Buffer Sampling] Sampled {len(samples)} groups. "
+                              f"Version range: [{min(versions)}, {max(versions)}], "
+                              f"Current version: {self.current_policy_version}")
 
             return samples
         else:
@@ -376,6 +391,7 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         new_groups = []
         duplicate_count = 0
         incomplete_count = 0
+        no_version_count = 0  # Track groups without policy_version
         new_version_count = 0  # Track new versions of existing prompts
 
         for group in samples:
@@ -393,7 +409,31 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
                 print(f"[Buffer] WARNING: Skipping incomplete group {group[0].group_index if hasattr(group[0], 'group_index') else '?'}: "
                       f"samples lack response. This may indicate a generation failure.")
                 continue  # Skip incomplete group
-            
+
+            # 🔧 FIX: Ensure all samples in group have correct policy_version for staleness tracking
+            # This is critical for off-policy training where staleness filtering depends on policy_version
+            group_policy_version = None
+            for sample in group:
+                if hasattr(sample, 'policy_version') and sample.policy_version is not None:
+                    # Use the first non-None policy_version found in the group
+                    if group_policy_version is None:
+                        group_policy_version = sample.policy_version
+                    # Ensure all samples in the same group have the same policy_version
+                    elif sample.policy_version != group_policy_version:
+                        print(f"[Buffer] WARNING: Inconsistent policy_version in group {group[0].group_index if hasattr(group[0], 'group_index') else '?'}: "
+                              f"found {sample.policy_version} but expected {group_policy_version}. Using first value.")
+                        sample.policy_version = group_policy_version
+
+            # If no policy_version found in the group, use current_policy_version
+            if group_policy_version is None:
+                no_version_count += 1
+                group_policy_version = self.current_policy_version
+                print(f"[Buffer] WARNING: Group {group[0].group_index if hasattr(group[0], 'group_index') else '?'} has no policy_version, "
+                      f"using current_policy_version={self.current_policy_version}")
+                # Set policy_version for all samples in the group
+                for sample in group:
+                    sample.policy_version = group_policy_version
+
             # TODO
             # # Check for exact duplicates (same prompt + same policy version)
             # if hasattr(group[0], 'group_index') and group[0].group_index is not None:
@@ -418,6 +458,9 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
 
         if incomplete_count > 0:
             print(f"[Buffer] Filtered {incomplete_count} incomplete groups (no response)")
+
+        if no_version_count > 0:
+            print(f"[Buffer] Fixed {no_version_count} groups with missing policy_version (set to current_policy_version={self.current_policy_version})")
 
         if new_version_count > 0:
             print(f"[Buffer] Adding {new_version_count} new versions of existing prompts (Off-Policy diversity)")
