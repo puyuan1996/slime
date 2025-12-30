@@ -78,7 +78,7 @@ PERF_ARGS=(
 
 # Define sampling strategy and max staleness (used for wandb name and config)
 BUFFER_SAMPLING_STRATEGY="random"
-MAX_STALENESS=1
+MAX_STALENESS=0
 
 # Generate wandb run name from sampling strategy and max staleness
 WANDB_RUN_NAME="buffer-sampling-${BUFFER_SAMPLING_STRATEGY}-max-staleness-${MAX_STALENESS}"

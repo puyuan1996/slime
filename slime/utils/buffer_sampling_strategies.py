@@ -130,6 +130,10 @@ class BaseSamplingStrategy(ABC):
             # Check staleness constraint
             if staleness <= self.max_staleness:
                 valid_groups.append(group)
+                # 🔧 FIX: Validate MAX_STALENESS=0 behavior
+                if self.max_staleness == 0 and staleness != 0:
+                    print(f"[Buffer Sampling] ERROR: MAX_STALENESS=0 but found staleness={staleness} > 0. "
+                          f"This should not happen - only current policy version should be sampled.")
             else:
                 stale_groups.append(group)
 
