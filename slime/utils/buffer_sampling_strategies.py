@@ -93,24 +93,57 @@ class BaseSamplingStrategy(ABC):
 
         valid_groups = []
         stale_groups = []
+        no_version_groups = []  # Track groups without policy_version
 
         for group in buffer:
-            # Check first sample's policy_version (all samples in group have same version)
-            sample = group[0]
-
-            if sample.policy_version is None:
-                # No version info, assume valid
-                valid_groups.append(group)
+            if len(group) == 0:
                 continue
 
+            # Check first sample's policy_version (all samples in group should have same version)
+            sample = group[0]
+
+            # 🔧 FIX: Strictly handle None policy_version
+            # For off-policy training, policy_version is critical for staleness calculation
+            # Groups without policy_version should be treated as stale and removed
+            if sample.policy_version is None:
+                # No version info - this is a bug! Should not happen if add_samples worked correctly
+                # For safety, treat as stale (very old) to avoid incorrect staleness calculation
+                no_version_groups.append(group)
+                print(f"[Buffer Sampling] WARNING: Group has None policy_version, treating as stale. "
+                      f"This should not happen - check add_samples() implementation.")
+                continue
+
+            # 🔧 FIX: Ensure current_policy_version is up-to-date
+            # Staleness = current_policy_version - sample.policy_version
+            # This must be non-negative (sample cannot be from future)
             staleness = self.current_policy_version - sample.policy_version
 
+            # Defensive check: negative staleness means sample is from future (impossible)
+            if staleness < 0:
+                print(f"[Buffer Sampling] WARNING: Negative staleness {staleness} detected! "
+                      f"current_policy_version={self.current_policy_version}, "
+                      f"sample.policy_version={sample.policy_version}. "
+                      f"Treating as stale.")
+                stale_groups.append(group)
+                continue
+
+            # Check staleness constraint
             if staleness <= self.max_staleness:
                 valid_groups.append(group)
+                # 🔧 FIX: Validate MAX_STALENESS=0 behavior
+                if self.max_staleness == 0 and staleness != 0:
+                    print(f"[Buffer Sampling] ERROR: MAX_STALENESS=0 but found staleness={staleness} > 0. "
+                          f"This should not happen - only current policy version should be sampled.")
             else:
                 stale_groups.append(group)
 
-        self.total_filtered += len(stale_groups)
+        self.total_filtered += len(stale_groups) + len(no_version_groups)
+        
+        if no_version_groups:
+            print(f"[Buffer Sampling] Found {len(no_version_groups)} groups with None policy_version, "
+                  f"treating as stale and will be removed.")
+            stale_groups.extend(no_version_groups)
+
         return valid_groups, stale_groups
 
     def filter_by_reuse_count(
@@ -496,10 +529,23 @@ class PrioritySamplingStrategy(BaseSamplingStrategy):
 
         # === Compute staleness ===
         sample = group[0]
-        if sample.policy_version is not None:
-            staleness_raw = self.current_policy_version - sample.policy_version
+        # 🔧 FIX: Strictly handle None policy_version for staleness calculation
+        if sample.policy_version is None:
+            # This should not happen if add_samples worked correctly
+            # For safety, treat as very stale (large staleness value)
+            print(f"[Priority Sampling] WARNING: Group has None policy_version, using large staleness value.")
+            staleness_raw = float('inf')  # Treat as infinitely stale
         else:
-            staleness_raw = 0.0
+            # 🔧 FIX: Ensure current_policy_version is up-to-date
+            # Staleness = current_policy_version - sample.policy_version
+            staleness_raw = self.current_policy_version - sample.policy_version
+            
+            # Defensive check: negative staleness means sample is from future (impossible)
+            if staleness_raw < 0:
+                print(f"[Priority Sampling] WARNING: Negative staleness {staleness_raw} detected! "
+                      f"current_policy_version={self.current_policy_version}, "
+                      f"sample.policy_version={sample.policy_version}. Using 0.")
+                staleness_raw = 0.0
 
         # === Update running statistics ===
         self._update_stats(base_score_raw, self.base_score_stats)
