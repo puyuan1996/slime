@@ -12,7 +12,7 @@ import wandb
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.backends.sglang_utils.sglang_engine import SGLangEngine
-from slime.ray.rollout_data_source import RolloutDataSourceWithBuffer
+from slime.ray.rollout_data_source_factory import create_rollout_data_source
 from slime.rollout.base_types import call_rollout_fn
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import find_available_port, get_host_info, init_http_client
@@ -45,7 +45,8 @@ class RolloutManager:
         )
         init_http_client(args)
 
-        self.data_source = RolloutDataSourceWithBuffer(args)
+        # === Create data source using factory (supports in_process/http/none) ===
+        self.data_source = create_rollout_data_source(args)
 
         self.generate_rollout = load_function(self.args.rollout_function_path)
         self.eval_generate_rollout = load_function(self.args.eval_function_path)
@@ -54,6 +55,21 @@ class RolloutManager:
             self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
         print(f"import {self.args.rollout_function_path} as generate_rollout function.")
         print(f"import {self.args.eval_function_path} as eval_generate_rollout function.")
+
+        # === Off-Policy tracking ===
+        self.current_policy_version = 0
+
+        # === Staleness Control ===
+        if args.max_staleness >= 0:
+            from slime.utils.offpolicy_utils import StalenessController
+            self.staleness_controller = StalenessController(
+                max_staleness=args.max_staleness,
+                batch_size=args.rollout_batch_size * args.n_samples_per_prompt,
+            )
+            print(f"[Staleness Control] Initialized with max_staleness={args.max_staleness}, batch_size={args.rollout_batch_size * args.n_samples_per_prompt}")
+        else:
+            self.staleness_controller = None
+            print("[Staleness Control] Disabled (max_staleness < 0)")
 
         if self.args.debug_train_only:
             self.all_rollout_engines = []
@@ -87,14 +103,184 @@ class RolloutManager:
         return len(self.data_source.dataset) // self.args.rollout_batch_size
 
     def generate(self, rollout_id):
+        # === Check staleness budget before generation ===
+        if self.staleness_controller is not None:
+            if not self.staleness_controller.can_submit_request():
+                print(
+                    f"[Staleness Control] WARNING: Rollout {rollout_id} would exceed staleness budget "
+                    f"(num_generated={self.staleness_controller.num_generated}, "
+                    f"policy_version={self.staleness_controller.current_policy_version}, "
+                    f"max_staleness={self.staleness_controller.max_staleness}). "
+                    f"Proceeding anyway, but this may degrade off-policy performance."
+                )
+
         monitor_started = self.args.use_fault_tolerance and self._health_monitor.start()
         start_time = time.time()
         try:
+            # === Step 1: Generate new rollout data ===
             data, metrics = self._get_rollout_data(rollout_id=rollout_id)
             self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
             _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
-            data = self._convert_samples_to_train_data(data)
-            return Box(ray.put(data))
+
+            # === Step 2: Add to buffer (automatic based on buffer_enabled) ===
+            # data is list[Sample] (flattened), add_samples will auto-group it
+            self.data_source.add_samples(data)
+
+            # === Step 3: Log buffer stats ===
+            buffer_stats = self.data_source.get_buffer_stats()
+            if buffer_stats["enabled"]:
+                print(f"[Buffer] Added {len(data)} samples. Stats: {buffer_stats}")
+                # Optional: log to wandb with comprehensive off-policy metrics
+                if wandb.run is not None:
+                    # Basic buffer metrics
+                    wandb_metrics = {
+                        "buffer/size": buffer_stats["buffer_size"],
+                        "buffer/utilization": buffer_stats["buffer_utilization"],
+                        "rollout_id": rollout_id,
+                    }
+
+                    # === NEW: Off-policy metrics ===
+                    # Policy version tracking
+                    if "current_policy_version" in buffer_stats:
+                        wandb_metrics["buffer/current_policy_version"] = buffer_stats["current_policy_version"]
+
+                    if "min_policy_version" in buffer_stats:
+                        wandb_metrics["buffer/min_policy_version"] = buffer_stats["min_policy_version"]
+                        wandb_metrics["buffer/max_policy_version"] = buffer_stats["max_policy_version"]
+                        wandb_metrics["buffer/avg_policy_version"] = buffer_stats["avg_policy_version"]
+
+                    # Staleness metrics
+                    if "min_staleness" in buffer_stats:
+                        wandb_metrics["buffer/min_staleness"] = buffer_stats["min_staleness"]
+                        wandb_metrics["buffer/max_staleness"] = buffer_stats["max_staleness"]
+                        wandb_metrics["buffer/avg_staleness"] = buffer_stats["avg_staleness"]
+
+                    # Sample reuse metrics
+                    if "avg_reuse_count" in buffer_stats:
+                        wandb_metrics["buffer/avg_reuse_count"] = buffer_stats["avg_reuse_count"]
+                        wandb_metrics["buffer/max_reuse_count_observed"] = buffer_stats["max_reuse_count_observed"]
+
+                    # Sampling strategy metrics
+                    if "strategy_strategy" in buffer_stats:
+                        wandb_metrics["buffer/strategy"] = buffer_stats["strategy_strategy"]
+
+                    # === NEW: Priority sampling specific metrics ===
+                    # Priority configuration
+                    if "strategy_priority_metric" in buffer_stats:
+                        wandb_metrics["buffer/priority_metric"] = buffer_stats["strategy_priority_metric"]
+                        wandb_metrics["buffer/priority_weight"] = buffer_stats["strategy_priority_weight"]
+                        wandb_metrics["buffer/staleness_penalty"] = buffer_stats["strategy_staleness_penalty"]
+
+                    # Base score statistics (raw)
+                    if "strategy_base_score_mean" in buffer_stats:
+                        wandb_metrics["buffer/base_score_mean"] = buffer_stats["strategy_base_score_mean"]
+                        wandb_metrics["buffer/base_score_min"] = buffer_stats["strategy_base_score_min"]
+                        wandb_metrics["buffer/base_score_max"] = buffer_stats["strategy_base_score_max"]
+
+                    # Staleness statistics (raw)
+                    if "strategy_staleness_mean" in buffer_stats:
+                        wandb_metrics["buffer/staleness_stat_mean"] = buffer_stats["strategy_staleness_mean"]
+                        wandb_metrics["buffer/staleness_stat_min"] = buffer_stats["strategy_staleness_min"]
+                        wandb_metrics["buffer/staleness_stat_max"] = buffer_stats["strategy_staleness_max"]
+
+                    # Latest sampling round statistics
+                    if "strategy_latest_base_score_raw_mean" in buffer_stats:
+                        wandb_metrics["buffer/latest_base_score_raw_mean"] = buffer_stats["strategy_latest_base_score_raw_mean"]
+                        wandb_metrics["buffer/latest_base_score_raw_std"] = buffer_stats["strategy_latest_base_score_raw_std"]
+                        wandb_metrics["buffer/latest_base_score_normalized_mean"] = buffer_stats["strategy_latest_base_score_normalized_mean"]
+
+                    if "strategy_latest_staleness_raw_mean" in buffer_stats:
+                        wandb_metrics["buffer/latest_staleness_raw_mean"] = buffer_stats["strategy_latest_staleness_raw_mean"]
+                        wandb_metrics["buffer/latest_staleness_raw_std"] = buffer_stats["strategy_latest_staleness_raw_std"]
+                        wandb_metrics["buffer/latest_staleness_normalized_mean"] = buffer_stats["strategy_latest_staleness_normalized_mean"]
+
+                    if "strategy_latest_final_score_mean" in buffer_stats:
+                        wandb_metrics["buffer/latest_final_score_mean"] = buffer_stats["strategy_latest_final_score_mean"]
+                        wandb_metrics["buffer/latest_final_score_std"] = buffer_stats["strategy_latest_final_score_std"]
+                        wandb_metrics["buffer/latest_final_score_min"] = buffer_stats["strategy_latest_final_score_min"]
+                        wandb_metrics["buffer/latest_final_score_max"] = buffer_stats["strategy_latest_final_score_max"]
+
+                    # Normalization configuration
+                    if "strategy_normalize_scores" in buffer_stats:
+                        wandb_metrics["buffer/normalize_scores"] = 1 if buffer_stats["strategy_normalize_scores"] else 0
+                        if buffer_stats.get("strategy_normalization_method"):
+                            # Log as config string (wandb will handle it)
+                            wandb_metrics["buffer/normalization_method"] = buffer_stats["strategy_normalization_method"]
+
+                    wandb.log(wandb_metrics)
+
+            # === Step 4: Sample data for training (mixes buffer + new data automatically) ===
+            # 🔧 IMPORTANT: Use get_training_samples() for training to avoid getting incomplete prompts
+            # get_training_samples() ONLY returns complete samples from buffer, no fallback to dataset
+            # get_samples() is used for rollout generation and may return PENDING prompts
+
+            if hasattr(self.data_source, 'get_training_samples') and self.data_source.buffer_enabled:
+                # Use dedicated method for training that only samples from buffer
+                train_data_samples = self.data_source.get_training_samples(
+                    num_samples=self.args.rollout_batch_size
+                )
+
+                # If buffer is empty/exhausted, skip this training step
+                if len(train_data_samples) == 0:
+                    print(f"[Training] Buffer exhausted, no samples available for training. Skipping this step.")
+                    print(f"[Training] Next rollout will generate new data to refill buffer.")
+                    return None  # Signal to skip training
+            else:
+                # Fallback to regular get_samples for backward compatibility
+                train_data_samples = self.data_source.get_samples(
+                    num_samples=self.args.rollout_batch_size
+                )
+
+            # 🔧 DEFENSIVE CHECK: Verify buffer samples are complete
+            if self.data_source.buffer_enabled and len(train_data_samples) > 0:
+                incomplete_groups = []
+                for i, group in enumerate(train_data_samples):
+                    for j, sample in enumerate(group):
+                        if sample.status == Sample.Status.PENDING and (not hasattr(sample, 'response') or not sample.response):
+                            incomplete_groups.append((i, j, sample))
+
+                if len(incomplete_groups) > 0:
+                    print(f"[CRITICAL WARNING] Found {len(incomplete_groups)} incomplete samples from buffer!")
+                    for i, j, sample in incomplete_groups[:5]:  # Show first 5
+                        print(f"  Group {i}, Sample {j}: "
+                              f"group_index={getattr(sample, 'group_index', '?')}, "
+                              f"index={getattr(sample, 'index', '?')}, "
+                              f"status={sample.status}, "
+                              f"has_response={hasattr(sample, 'response') and bool(sample.response)}")
+
+                    raise RuntimeError(
+                        f"Buffer integrity error: {len(incomplete_groups)} incomplete samples detected! "
+                        f"This indicates buffer contamination. Check buffer filtering logic."
+                    )
+
+            # === Step 5: Flatten grouped samples for _convert_samples_to_train_data ===
+            # _convert_samples_to_train_data expects list[Sample], not list[list[Sample]]
+            if len(train_data_samples) > 0 and isinstance(train_data_samples[0], list):
+                # Flatten: list[list[Sample]] -> list[Sample]
+                flattened_samples = []
+                for group in train_data_samples:
+                    flattened_samples.extend(group)
+                train_data_samples = flattened_samples
+
+            # === Step 6: Convert to training format ===
+            # IMPORTANT: Verify all samples have valid rewards before conversion
+            none_reward_indices = [i for i, s in enumerate(train_data_samples) if s.reward is None]
+            if len(none_reward_indices) > 0:
+                print(f"[CRITICAL ERROR] Found {len(none_reward_indices)}/{len(train_data_samples)} samples with None rewards before training!")
+                print(f"[CRITICAL ERROR] Indices: {none_reward_indices[:10]}{'...' if len(none_reward_indices) > 10 else ''}")
+                # Force set to 0 to prevent crash
+                for idx in none_reward_indices:
+                    print(f"[CRITICAL ERROR] Forcing reward=1e-8 for sample {idx} {train_data_samples[idx]}")
+                    train_data_samples[idx].reward = 1e-8
+
+            train_data = self._convert_samples_to_train_data(train_data_samples)
+
+            # === Step 7: Record generated batch in staleness controller ===
+            if self.staleness_controller is not None:
+                num_samples = len(train_data["tokens"])
+                self.staleness_controller.on_generation_completed(num_samples)
+
+            return Box(ray.put(train_data))
         finally:
             if monitor_started:
                 self._health_monitor.stop()
@@ -155,7 +341,90 @@ class RolloutManager:
                 origin_data_length = len(data)
                 data = data[:trim_len]
                 print(f"trim number of samples from {origin_data_length} to {trim_len}")
+
+        # === Tag samples with current policy version (ENHANCED) ===
+        # IMPORTANT: Only set policy_version for NEW samples (from dataset)
+        # For samples from buffer (re-generation), they already have policy_version
+        # and we should NOT overwrite it, otherwise we lose track of when they were generated
+
+        untagged_count = 0
+        retagged_count = 0
+        invalid_count = 0
+
+        for sample in data:
+            # Case 1: Sample has no policy_version attribute or it's None
+            if not hasattr(sample, 'policy_version') or sample.policy_version is None:
+                sample.policy_version = self.current_policy_version
+                untagged_count += 1
+
+            # Case 2: Sample has an INVALID policy_version (defensive check)
+            elif not isinstance(sample.policy_version, int) or sample.policy_version < 0:
+                print(f"[WARNING] Sample has invalid policy_version={sample.policy_version}, "
+                      f"retagging with current version {self.current_policy_version}")
+                sample.policy_version = self.current_policy_version
+                invalid_count += 1
+
+            # Case 3: Sample already has a valid policy_version
+            else:
+                # This is expected for samples from buffer (shouldn't happen in generate())
+                # Log if version is much older than current (potential issue)
+                staleness = self.current_policy_version - sample.policy_version
+                if staleness > 10:  # Threshold for warning
+                    print(f"[WARNING] Sample with very old policy_version={sample.policy_version} "
+                          f"detected (current={self.current_policy_version}, staleness={staleness}). "
+                          f"This may indicate a buffer issue.")
+
+        # Log summary for monitoring
+        if untagged_count > 0:
+            print(f"[Policy Version] Tagged {untagged_count} new samples with version {self.current_policy_version}")
+        if invalid_count > 0:
+            print(f"[Policy Version] Fixed {invalid_count} samples with invalid policy_version")
+
         return data, metrics
+
+    def on_policy_update(self):
+        """
+        Called after training completes to increment policy version.
+
+        CRITICAL: This method must be called after EVERY training step to ensure
+        policy_version stays in sync with actual policy updates.
+        """
+        old_version = self.current_policy_version
+        self.current_policy_version += 1
+        new_version = self.current_policy_version
+
+        print(f"[Off-Policy Tracking] Policy version updated: {old_version} -> {new_version}")
+
+        # === Update data source policy version (MANDATORY) ===
+        # This MUST succeed to maintain consistency
+        if hasattr(self.data_source, 'update_policy_version'):
+            self.data_source.update_policy_version(new_version)
+
+            # === VERIFICATION: Check if update succeeded ===
+            if hasattr(self.data_source, 'current_policy_version'):
+                actual_version = self.data_source.current_policy_version
+                if actual_version != new_version:
+                    # CRITICAL ERROR: Version mismatch detected
+                    raise RuntimeError(
+                        f"[CRITICAL] Policy version sync failed! "
+                        f"RolloutManager.current_policy_version={new_version}, "
+                        f"DataSource.current_policy_version={actual_version}. "
+                        f"This will cause incorrect staleness calculation!"
+                    )
+                print(f"[Off-Policy Tracking] DataSource policy version verified: {actual_version}")
+        else:
+            # CRITICAL WARNING: DataSource doesn't support policy version tracking
+            print(f"[WARNING] DataSource does not implement update_policy_version()! "
+                  f"Staleness-aware sampling will NOT work correctly. "
+                  f"Please ensure your DataSource class inherits from RolloutDataSourceWithBuffer.")
+
+        # === Update staleness controller ===
+        if self.staleness_controller is not None:
+            self.staleness_controller.on_training_step()
+            print(
+                f"[Staleness Control] Updated - num_generated={self.staleness_controller.num_generated}, "
+                f"policy_version={self.staleness_controller.current_policy_version}"
+            )
 
     def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
         # TODO to be refactored (originally Buffer._set_data)
@@ -181,12 +450,56 @@ class RolloutManager:
             return self.custom_reward_post_process_func(self.args, samples)
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
+
+        # === NEW: Handle None rewards robustly ===
+        # Check for None values and provide meaningful default
+        none_count = sum(1 for r in raw_rewards if r is None)
+
+        if none_count > 0:
+            # Get valid rewards for statistics
+            valid_rewards = [r for r in raw_rewards if r is not None]
+
+            # Determine fallback value based on valid rewards
+            if len(valid_rewards) > 0:
+                # Use mean of valid rewards as fallback (more reasonable than 0)
+                fallback_value = sum(valid_rewards) / len(valid_rewards)
+                print(f"[WARNING] Found {none_count}/{len(raw_rewards)} samples with None rewards. "
+                      f"Using mean of valid rewards ({fallback_value:.4f}) as fallback.")
+            else:
+                # All rewards are None - use 0.0 and warn loudly
+                # fallback_value = 0.0
+                fallback_value = 1e-8
+                print(f"[ERROR] ALL {len(raw_rewards)} samples have None rewards! "
+                      f"This indicates a serious issue with the reward function. "
+                      f"Using fallback value 1e-8, but you should investigate immediately.")
+
+                # Optionally log to wandb if available
+                if wandb.run is not None:
+                    wandb.log({
+                        "error/all_rewards_none": 1,
+                        "error/none_reward_count": none_count,
+                    })
+
+            # Replace None with fallback value
+            raw_rewards_clean = [r if r is not None else fallback_value for r in raw_rewards]
+
+            # Log statistics to wandb
+            if wandb.run is not None:
+                wandb.log({
+                    "reward/none_count": none_count,
+                    "reward/none_ratio": none_count / len(raw_rewards),
+                    "reward/fallback_value": fallback_value,
+                })
+        else:
+            raw_rewards_clean = raw_rewards
+
+        # Use cleaned rewards for further processing
         if (
             self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
         ):
             # group norm
-            rewards = torch.tensor(raw_rewards, dtype=torch.float)
+            rewards = torch.tensor(raw_rewards_clean, dtype=torch.float)
             if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
                 rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
             else:
@@ -199,9 +512,10 @@ class RolloutManager:
                 std = rewards.std(dim=-1, keepdim=True)
                 rewards = rewards / (std + 1e-6)
 
+            # Return original raw_rewards (with None) for logging, but use clean rewards for training
             return raw_rewards, rewards.flatten().tolist()
 
-        return raw_rewards, raw_rewards
+        return raw_rewards, raw_rewards_clean
 
     def _convert_samples_to_train_data(self, samples: Union[list[Sample], list[list[Sample]]]):
         """
@@ -256,6 +570,29 @@ class RolloutManager:
 
         if "teacher_log_probs" in samples[0].__dict__:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+
+        # === Add policy versions for off-policy tracking ===
+        # For off-policy GRPO, policy_version is CRITICAL and must always be present
+        is_offpolicy_mode = hasattr(self.args, "loss_type") and self.args.loss_type == "decoupled_policy_loss"
+
+        # Collect all policy versions, handling None values robustly
+        policy_versions = []
+        none_count = 0
+        for sample in samples:
+            pv = getattr(sample, 'policy_version', None)
+            if pv is None:
+                none_count += 1
+                pv = 0  # Fallback to version 0
+            policy_versions.append(pv)
+
+        # Always add policy_versions for off-policy mode
+        if is_offpolicy_mode:
+            train_data["policy_versions"] = policy_versions
+            if none_count > 0:
+                print(f"[WARNING] {none_count}/{len(samples)} samples had None policy_version, using 0 as default")
+        elif samples[0].policy_version is not None:
+            # For on-policy mode, only add if explicitly set
+            train_data["policy_versions"] = policy_versions
 
         return train_data
 

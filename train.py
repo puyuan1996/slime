@@ -66,6 +66,12 @@ def train(args):
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
+        # 🔧 FIX: Handle case where training is skipped due to exhausted buffer
+        if rollout_data_ref is None:
+            print(f"[Train] Step {rollout_id}: Training skipped - buffer exhausted, no samples available.")
+            print(f"[Train] Continuing to next rollout to generate new data...")
+            continue  # Skip to next iteration to trigger rollout generation
+
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())
 
@@ -76,6 +82,9 @@ def train(args):
             ray.get(critic_train_handle)
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+
+        # === Notify rollout manager that policy has been updated ===
+        ray.get(rollout_manager.on_policy_update.remote())
 
         if args.save_interval is not None and (
             (rollout_id + 1) % args.save_interval == 0
