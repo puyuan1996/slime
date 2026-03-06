@@ -60,7 +60,7 @@ def init_wandb_primary(args):
     # Settings setup
     if offline:
         init_kwargs["settings"] = wandb.Settings(mode="offline")
-        # 【关键修复】Offline模式下，主进程也使用独立目录，避免与同节点的其他进程冲突
+        # Offline模式下，主进程也使用独立目录，避免与同节点的其他进程冲突
         if args.wandb_dir:
             unique_dir = _get_unique_dir(args.wandb_dir, args.rank, "primary")
             os.makedirs(unique_dir, exist_ok=True)

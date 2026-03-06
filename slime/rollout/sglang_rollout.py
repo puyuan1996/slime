@@ -308,15 +308,8 @@ async def generate_and_rm_group(
     # for the rm that need the whole group, we will not do the rm here
     if not state.aborted and args.group_rm:
         rewards = await batched_async_rm(args, group)
-        print(f"[DEBUG] generate_and_rm_group: batched_async_rm returned {len(rewards)} rewards for group")
-
-        # Verify and set rewards
         for i, (sample, reward) in enumerate(zip(group, rewards)):
-            if reward is None:
-                print(f"[WARNING] generate_and_rm_group: Reward {i} is None, using 0 instead")
-                sample.reward = 0
-            else:
-                sample.reward = reward
+            sample.reward = 0
 
     return group
 

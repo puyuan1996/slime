@@ -829,25 +829,6 @@ def decoupled_policy_loss_function(
     if getattr(args, "enable_m2po_filtering", False):
         # if is_megatron_main_rank():
         #     print(f"[M2PO] entered!")   
-        # Check if we have policy version information
-        # if batch.get("policy_versions") is not None and batch.get("current_policy_version") is not None:
-            # if is_megatron_main_rank():
-            #     print(f"[M2PO] entered! ch.get("policy_versions") is not None and batch.get("current_policy_version") is not Non")   
-            # from slime.utils.offpolicy_utils import apply_m2po_filtering
-
-            # current_version = batch["current_policy_version"][0] if isinstance(batch["current_policy_version"], list) else batch["current_policy_version"]
-            # policy_versions = batch["policy_versions"]
-
-            # # Calculate policy version gap for each sample
-            # if isinstance(policy_versions, list):
-            #     policy_version_gaps = [current_version - v for v in policy_versions]
-            #     max_gap = max(policy_version_gaps)
-            # else:
-            #     policy_version_gaps = current_version - policy_versions
-            #     max_gap = policy_version_gaps.max().item()
-
-        # Track max gap metric
-        # m2po_metrics["m2po_max_gap"] = torch.tensor(max_gap, dtype=torch.float32, device=log_probs.device)
 
         # Apply M2PO filtering (removed gap >= 2 restriction)
         # M2PO filtering now always executes when enabled in off-policy mode
@@ -886,15 +867,6 @@ def decoupled_policy_loss_function(
         # Update batch with filtered masks
         batch["loss_masks"] = modified_loss_masks
 
-        # CRITICAL FIX: Do NOT rebuild sum_of_sample_mean!
-        # AReaL uses the original token count as denominator to avoid loss amplification.
-        # When filter_rate increases, rebuilding sum_of_sample_mean causes:
-        #   - Original: loss = sum(filtered_loss) / original_token_count
-        #   - Bug: loss = sum(filtered_loss) / filtered_token_count  <- amplifies loss!
-        # This causes training collapse when filter_rate > 80%.
-        #
-        # The original sum_of_sample_mean (computed before M2PO filtering) already
-        # uses the correct denominator, so we keep it unchanged.
 
         # Track M2PO filtering metrics
         total_tokens_after = sum(m.sum().item() for m in batch["loss_masks"])
