@@ -19,7 +19,7 @@ import argparse
 import json
 import warnings
 from typing import Optional
-import threading  # 1. [修改] 导入 threading 模块
+import threading
 
 import datasets
 import faiss
@@ -143,7 +143,6 @@ class BaseRetriever:
 
 
 class BM25Retriever(BaseRetriever):
-    # BM25Retriever 不涉及 GPU，无需修改
     def __init__(self, config):
         super().__init__(config)
         from pyserini.search.lucene import LuceneSearcher
@@ -202,7 +201,7 @@ class BM25Retriever(BaseRetriever):
         else:
             return results
 
-# 2. [修改] 创建一个全局线程锁，用于保护对 GPU 资源的访问
+# Global thread lock to protect GPU resource access
 gpu_lock = threading.Lock()
 
 class DenseRetriever(BaseRetriever):
@@ -229,8 +228,8 @@ class DenseRetriever(BaseRetriever):
     def _search(self, query: str, num: int = None, return_score: bool = False):
         if num is None:
             num = self.topk
-        
-        # 3. [修改] 使用 with 语句块包裹 GPU 操作，自动获取和释放锁
+
+        # Lock GPU operations to ensure thread safety
         with gpu_lock:
             query_emb = self.encoder.encode(query)
             scores, idxs = self.index.search(query_emb, k=num)
@@ -253,13 +252,13 @@ class DenseRetriever(BaseRetriever):
         scores = []
         for start_idx in tqdm(range(0, len(query_list), self.batch_size), desc="Retrieval process: "):
             query_batch = query_list[start_idx : start_idx + self.batch_size]
-            
-            # 4. [修改] 在循环内部，仅对 GPU 密集型操作加锁
+
+            # Lock only GPU-intensive operations
             with gpu_lock:
                 batch_emb = self.encoder.encode(query_batch)
                 batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
 
-            # 在锁释放后处理数据，以最小化锁的持有时间
+            # Process data after lock is released to minimize lock hold time
             batch_scores = batch_scores.tolist()
             batch_idxs = batch_idxs.tolist()
 
@@ -332,6 +331,29 @@ app = FastAPI()
 
 @app.post("/retrieve")
 def retrieve_endpoint(request: QueryRequest):
+    """
+    Endpoint that accepts queries and performs retrieval.
+
+    Input format:
+    {
+      "queries": ["What is Python?", "Tell me about neural networks."],
+      "topk": 3,
+      "return_scores": true
+    }
+
+    Output format (when return_scores=True, similarity scores are returned):
+    {
+        "result": [
+            [   # Results for each query
+                {
+                    {"document": doc, "score": score}
+                },
+                # ... more documents
+            ],
+            # ... results for other queries
+        ]
+    }
+    """
     if not request.topk:
         request.topk = config.retrieval_topk
 
@@ -393,6 +415,5 @@ if __name__ == "__main__":
 
     retriever = get_retriever(config)
 
-    # 5. [修改] 现在代码是线程安全的，可以安全地移除 `workers=1` 限制，
-    # 允许 uvicorn 使用默认的多个工作线程来提高并发处理能力。
+    # Thread-safe with gpu_lock, allows multiple workers for better concurrency
     uvicorn.run(app, host="0.0.0.0", port=8000)
