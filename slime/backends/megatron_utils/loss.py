@@ -717,19 +717,6 @@ def decoupled_policy_loss_function(
     entropy = log_probs_and_entropy["entropy"]
 
     # === 2. Get proximal policy log probs ===
-    # DEBUG: Print what's in batch
-    if is_megatron_main_rank():
-        print(f"[BATCH DEBUG] Keys in batch: {list(batch.keys())}")
-        print(f"[BATCH DEBUG] use_proximal_logp_approximation: {batch.get('use_proximal_logp_approximation', False)}")
-        if "proximal_log_probs" in batch:
-            print(f"[BATCH DEBUG] proximal_log_probs exists, length: {len(batch['proximal_log_probs'])}")
-        if "behavior_log_probs" in batch:
-            print(f"[BATCH DEBUG] behavior_log_probs exists, length: {len(batch['behavior_log_probs'])}")
-        if "rollout_log_probs" in batch:
-            print(f"[BATCH DEBUG] rollout_log_probs exists, length: {len(batch['rollout_log_probs'])}")
-        if "log_probs" in batch:
-            print(f"[BATCH DEBUG] log_probs exists, length: {len(batch['log_probs'])}")
-
     if batch.get("use_proximal_logp_approximation", False):                                                                                                              
         # Use approximation method                                                                                                                                       
         from slime.utils.proximal_logp_utils import approximate_proximal_log_probs                                                                                       
@@ -768,18 +755,14 @@ def decoupled_policy_loss_function(
     if "behavior_log_probs" in batch and batch["behavior_log_probs"] is not None:
         behavior_log_probs = batch["behavior_log_probs"]
     else:
-        # CRITICAL FIX: Prioritize rollout_log_probs (behavior policy that generated the data)
-        # over log_probs (old_actor, which may be same as proximal policy)
+        # Prioritize rollout_log_probs (behavior policy that generated the data)
+        # over log_probs (old_actor, which may be the same as proximal policy)
         if "rollout_log_probs" in batch and batch["rollout_log_probs"] is not None:
             # Use rollout log probs (behavior policy that generated trajectories)
             behavior_log_probs = batch["rollout_log_probs"]
-            if is_megatron_main_rank():
-                print(f"[Off-Policy] Using rollout_log_probs as behavior policy")
         elif "log_probs" in batch and batch["log_probs"] is not None:
             # Fallback: use old_actor log probs (computed in train_actor) as behavior policy
             behavior_log_probs = batch["log_probs"]
-            if is_megatron_main_rank():
-                print(f"[Off-Policy] Using log_probs (old_actor) as behavior policy")
         else:
             raise ValueError(
                 "batch must contain either 'behavior_log_probs', 'rollout_log_probs', or 'log_probs' "
@@ -823,32 +806,18 @@ def decoupled_policy_loss_function(
     log_ratio_intermediate = proximal_log_probs - log_probs
 
     # === 6.5. Apply M2PO filtering if enabled ===
-    m2po_metrics = {}  # Initialize M2PO metrics dictionary
-    # print(f"args.enable_m2po_filtering:{args.enable_m2po_filtering}")   
-     
-    if getattr(args, "enable_m2po_filtering", False):
-        # if is_megatron_main_rank():
-        #     print(f"[M2PO] entered!")   
+    m2po_metrics = {}
 
+    if getattr(args, "enable_m2po_filtering", False):
         # Apply M2PO filtering (removed gap >= 2 restriction)
-        # M2PO filtering now always executes when enabled in off-policy mode
-        # When gap = 0 or 1, m2 values will be small and filtering will be minimal/none
-        # When gap >= 2, m2 values will be larger and filtering will be more aggressive
+        # M2PO filtering executes when enabled in off-policy mode
+        # When gap = 0 or 1, m2 values are small and filtering is minimal
+        # When gap >= 2, m2 values are larger and filtering is more aggressive
 
         # Compute second-momentum (m2) for M2PO filtering
         # M2PO filters based on (log(π_behave) - log(π_prox))^2
-        # This measures the divergence between behavior and proximal policies
-        # CRITICAL FIX: Use behavior_log_probs instead of log_probs (current policy)
         delta = behavior_log_probs - proximal_log_probs  # log(π_behave) - log(π_prox)
-        m2 = delta * delta  # second-momentum
-
-        # DEBUG: Print m2 statistics
-        if is_megatron_main_rank():
-            print(f"[M2PO DEBUG] m2 shape: {m2.shape}")
-            print(f"[M2PO DEBUG] m2 min/max/mean: {m2.min().item():.6f} / {m2.max().item():.6f} / {m2.mean().item():.6f}")
-            print(f"[M2PO DEBUG] delta min/max/mean: {delta.min().item():.6f} / {delta.max().item():.6f} / {delta.mean().item():.6f}")
-            print(f"[M2PO DEBUG] behavior_log_probs sample: {behavior_log_probs[:5].tolist()}")
-            print(f"[M2PO DEBUG] proximal_log_probs sample: {proximal_log_probs[:5].tolist()}")
+        m2 = delta * delta
 
         # Calculate total tokens before filtering
         total_tokens_before = sum(m.sum().item() for m in batch["loss_masks"])
@@ -856,18 +825,15 @@ def decoupled_policy_loss_function(
         # Apply M2PO filtering to loss masks
         m2po_threshold = getattr(args, "m2po_threshold", 0.04)
         modified_loss_masks, num_filtered = apply_m2po_filtering(
-            m2=m2,  # Pass m2 instead of importance_weights
+            m2=m2,
             loss_masks=batch["loss_masks"],
             threshold=m2po_threshold,
-            # policy_version_gaps=policy_version_gaps,
             policy_version_gaps=None,
-            min_gap_for_filtering=0  # Changed from 2 to 0: no gap restriction
+            min_gap_for_filtering=0
         )
 
         # Update batch with filtered masks
         batch["loss_masks"] = modified_loss_masks
-
-
         # Track M2PO filtering metrics
         total_tokens_after = sum(m.sum().item() for m in batch["loss_masks"])
         filter_rate = num_filtered / max(total_tokens_before, 1)
@@ -945,13 +911,10 @@ def decoupled_policy_loss_function(
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 
     # Optionally log staleness statistics
-    # Check both key existence AND non-None values
+    # Check both key existence and non-None values
     if (batch.get("policy_versions") is not None and
         batch.get("current_policy_version") is not None):
-        
-        if is_megatron_main_rank():
-            print(f"batch policy_versions is not None")  # TODO
-        
+
         from slime.utils.offpolicy_utils import compute_policy_version_staleness
 
         # current_policy_version is a list with the same value for all samples

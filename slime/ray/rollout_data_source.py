@@ -184,26 +184,13 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         """
         Get samples for rollout generation - ALWAYS returns NEW prompts from dataset.
 
-        🔧 CRITICAL FIX: This method is used by generate_rollout() to get prompts for generation.
-        We must ALWAYS return NEW prompts from the dataset, NOT existing samples from buffer.
+        This method is used by generate_rollout() to get prompts for generation.
+        Returns NEW prompts from the dataset, NOT existing samples from buffer.
 
         Why this is important:
-        - Before fix: When buffer had samples, we'd return those (which already have responses)
-        - This meant NO NEW DATA was generated until buffer was exhausted
-        - With --buffer-reuse-samples=10, buffer could serve the same data 10+ times
-        - Result: Policy trained on stale data without generating fresh samples
-
-        After fix:
-        - ALWAYS get new prompts from dataset for generation
-        - Each rollout iteration generates fresh data with current policy
+        - Ensures continuous data generation with current policy
         - Buffer is used ONLY for training (via get_training_samples())
-        - This ensures continuous data generation regardless of buffer state
-
-        Behavior:
-        - Buffer disabled: return new samples from dataset (on-policy)
-        - Buffer enabled: return new samples from dataset (for generation)
-
-        Note: For training, use get_training_samples() which samples from buffer.
+        - Each rollout iteration generates fresh data regardless of buffer state
 
         Args:
             num_samples: Number of sample groups to retrieve
@@ -211,8 +198,7 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         Returns:
             List of NEW sample groups from dataset (prompts only, no responses)
         """
-        # 🔧 FIX: Always get new prompts from dataset, regardless of buffer state
-        # This ensures every rollout generates fresh data with the current policy
+        # ALWAYS get new prompts from dataset for rollout generation
         samples = super().get_samples(num_samples=num_samples)
 
         if self.buffer_enabled:
@@ -225,14 +211,11 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         """
         Get samples ONLY for training purposes.
 
-        CRITICAL DIFFERENCE from get_samples():
-        - get_samples(): Used for rollout generation, may fallback to dataset for new prompts
+        Key difference from get_samples():
+        - get_samples(): Used for rollout generation, returns new prompts from dataset
         - get_training_samples(): Used for training, ONLY returns complete samples from buffer
 
-        This method:
-        - ONLY samples from buffer (never falls back to dataset)
-        - Returns empty list if buffer is exhausted
-        - Ensures all returned samples are COMPLETE (have response and reward)
+        Returns empty list if buffer is exhausted.
 
         Args:
             num_samples: Number of sample groups requested
@@ -261,14 +244,14 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         """
         Sample from buffer using configured sampling strategy.
 
-        ENHANCED: Added consistency checks for policy_version to ensure robustness.
+        Includes consistency checks for policy_version to ensure robustness.
         """
         if len(self.buffer) == 0 or num_samples == 0:
             return []
 
         # NEW: Use sampling strategy instead of direct buffer_filter call
         if self.sampling_strategy is not None:
-            # === CONSISTENCY CHECK: Verify sampling strategy version ===
+            # Verify sampling strategy version consistency
             if self.sampling_strategy.current_policy_version != self.current_policy_version:
                 print(f"[WARNING] Sampling strategy version mismatch detected! "
                       f"DataSource={self.current_policy_version}, "
@@ -279,7 +262,7 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             # Sample using strategy
             samples = self.sampling_strategy.sample(self.buffer, num_samples)
 
-            # === VALIDATION: Check sampled data for anomalies ===
+            # Validate sampled data for anomalies
             if len(samples) > 0:
                 versions = []
                 staleness_values = []
@@ -294,7 +277,7 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
                         # Check for anomalies
                         if staleness < 0:
                             raise RuntimeError(
-                                f"[CRITICAL] Negative staleness detected! "
+                                f"Negative staleness detected! "
                                 f"sample.policy_version={sample.policy_version}, "
                                 f"current_policy_version={self.current_policy_version}. "
                                 f"This indicates policy_version was set incorrectly or "
@@ -354,7 +337,7 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         # Validation
         assert isinstance(samples, list), f"samples must be a list, got {type(samples)}"
 
-        # === Auto-detect format and convert if needed ===
+        # Auto-detect format and convert if needed
         if len(samples) > 0 and not isinstance(samples[0], list):
             # Format: list[Sample] (flattened)
             # Need to group by n_samples_per_prompt
@@ -381,18 +364,11 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             assert len(group) == self.args.n_samples_per_prompt, \
                 f"Group {i} has {len(group)} samples, expected {self.args.n_samples_per_prompt}"
 
-        # 🔧 FIX: Policy-version-aware duplicate detection for Off-Policy training
-        # Key insight for Off-Policy GRPO:
-        # - group_index identifies the PROMPT
-        # - Same prompt + different policy version = DIFFERENT valuable data (should KEEP both!)
-        # - Same prompt + same policy version = TRUE duplicate (should skip)
-        #
-        # Off-Policy training benefits from keeping multiple versions:
-        # - Diversity: Same prompt with different responses from different policies
-        # - Data efficiency: Reuse historical data generated by older policies
-        # - Buffer utilization: Don't waste any generated samples
+        # Policy-version-aware duplicate detection for Off-Policy training
+        # Key insight: Same prompt + different policy version = different valuable data
+        # Only skip exact duplicates: same prompt + same policy version
 
-        # Build index: (group_index, policy_version) -> True (for exact duplicate detection)
+        # Build index: (group_index, policy_version) -> True
         buffer_index = set()
         for group in self.buffer:
             if len(group) > 0 and hasattr(group[0], 'group_index') and group[0].group_index is not None:
@@ -410,7 +386,7 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
             if len(group) == 0:
                 continue
 
-            # 🔧 DEFENSIVE: Verify all samples in group have responses
+            # Verify all samples in group have responses
             group_is_complete = all(
                 hasattr(s, 'response') and s.response is not None and s.response != ''
                 for s in group

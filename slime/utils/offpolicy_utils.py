@@ -21,7 +21,6 @@ import torch
 import torch.distributed as dist
 
 
-@torch.compile(dynamic=True)
 def compute_offpolicy_importance_weights(
     proximal_log_probs: torch.Tensor,
     behavior_log_probs: torch.Tensor,
@@ -53,9 +52,8 @@ def compute_offpolicy_importance_weights(
     return importance_weights
 
 
-@torch.compile(dynamic=True)
 def compute_decoupled_policy_loss(
-    log_ratio_intermediate: torch.Tensor,  # log(π_prox) - log(π_θ) from loss.py
+    log_ratio_intermediate: torch.Tensor,  # log(π_prox) - log(π_θ)
     importance_weights: torch.Tensor,  # π_prox / π_behav
     advantages: torch.Tensor,
     eps_clip: float,
@@ -86,9 +84,7 @@ def compute_decoupled_policy_loss(
         pg_losses: Per-token losses [num_tokens]
         clipfrac: Clipping fraction (for monitoring)
     """
-    # Compute ratio: π_θ / π_prox = exp(-(log(π_prox) - log(π_θ)))
-    #                              = exp(log(π_θ) - log(π_prox))
-    #                              = π_θ / π_prox
+    # Compute ratio: π_θ / π_prox
     ratio_prox = (-log_ratio_intermediate).exp()
 
     # Unclipped loss
@@ -112,11 +108,8 @@ def compute_decoupled_policy_loss(
     else:
         pg_losses = clip_pg_losses1
 
-    # Apply behavior importance weight capping (AReaL-style protection)
-    # This filters out tokens with extreme importance weights to prevent gradient explosion
+    # Apply behavior importance weight capping: zeros out extreme IS weights
     if behav_imp_weight_cap is not None:
-        # Set importance weights to 0 for tokens exceeding the cap
-        # This is different from clipping: we completely exclude extreme tokens
         importance_weights = torch.where(
             importance_weights <= behav_imp_weight_cap,
             importance_weights,
@@ -431,22 +424,11 @@ def apply_m2po_filtering(
     mask_flat = all_masks_flat.bool()
     m2_selected = m2.view(-1)[mask_flat]
 
-    # DEBUG: Print filtering statistics
-    print(f"[M2PO FILTER DEBUG] Total tokens: {m2.numel()}, Valid tokens (mask=1): {m2_selected.numel()}")
-    if m2_selected.numel() > 0:
-        print(f"[M2PO FILTER DEBUG] m2_selected min/max/mean: {m2_selected.min().item():.6f} / {m2_selected.max().item():.6f} / {m2_selected.mean().item():.6f}")
-        print(f"[M2PO FILTER DEBUG] threshold: {threshold}, threshold*0.1: {threshold*0.1}")
-
     if m2_selected.numel() == 0:
-        # No valid tokens to filter
-        print(f"[M2PO FILTER DEBUG] Early exit: no valid tokens")
         return loss_masks, 0
 
-    # Early exit optimization: if all m2 values are very small, skip filtering
-    # This handles the case when gap = 0 or 1 where m2 ≈ 0
+    # Early exit: if all m2 values << threshold, no filtering needed
     if m2_selected.max() < threshold * 0.1:
-        # All m2 values are far below threshold, no need to filter
-        print(f"[M2PO FILTER DEBUG] Early exit: max m2 ({m2_selected.max().item():.6f}) < threshold*0.1 ({threshold*0.1:.6f})")
         return loss_masks, 0
 
     # Sort m2 values in descending order
@@ -459,11 +441,7 @@ def apply_m2po_filtering(
         m2_threshold=threshold
     )
 
-    # DEBUG: Print mask statistics
     num_to_filter = (~sorted_m2_loss_mask).sum().item()
-    print(f"[M2PO FILTER DEBUG] After _get_m2po_loss_mask: will filter {num_to_filter}/{sorted_m2_loss_mask.numel()} tokens")
-    print(f"[M2PO FILTER DEBUG] sorted_m2 top 5: {sorted_m2[:5].tolist()}")
-    print(f"[M2PO FILTER DEBUG] sorted_m2_loss_mask top 5: {sorted_m2_loss_mask[:5].tolist()}")
 
     # Restore original order
     m2_selected_mask = sorted_m2_loss_mask[restored_indices]

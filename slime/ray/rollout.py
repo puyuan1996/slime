@@ -107,10 +107,7 @@ class RolloutManager:
         if self.staleness_controller is not None:
             if not self.staleness_controller.can_submit_request():
                 print(
-                    f"[Staleness Control] WARNING: Rollout {rollout_id} would exceed staleness budget "
-                    f"(num_generated={self.staleness_controller.num_generated}, "
-                    f"policy_version={self.staleness_controller.current_policy_version}, "
-                    f"max_staleness={self.staleness_controller.max_staleness}). "
+                    f"[Staleness Control] WARNING: Rollout {rollout_id} would exceed staleness budget. "
                     f"Proceeding anyway, but this may degrade off-policy performance."
                 )
 
@@ -131,16 +128,14 @@ class RolloutManager:
             if buffer_stats["enabled"]:
                 # print(f"[Buffer] Added {len(data)} samples. Stats: {buffer_stats}") # 原有的简单打印
 
-                # ================= 修复开始 =================
-                # 1. 无论 wandb 状态如何，先构建完整的 metrics 字典
+                # 1. Build complete metrics dictionary for logging
                 wandb_metrics = {
                     "buffer/size": buffer_stats["buffer_size"],
                     "buffer/utilization": buffer_stats["buffer_utilization"],
                     "rollout_id": rollout_id,
                 }
 
-                # === NEW: Off-policy metrics ===
-                # Policy version tracking
+                # Off-policy metrics: policy version tracking
                 if "current_policy_version" in buffer_stats:
                     wandb_metrics["buffer/current_policy_version"] = buffer_stats["current_policy_version"]
 
@@ -164,8 +159,7 @@ class RolloutManager:
                 if "strategy_strategy" in buffer_stats:
                     wandb_metrics["buffer/strategy"] = buffer_stats["strategy_strategy"]
 
-                # === NEW: Priority sampling specific metrics ===
-                # Priority configuration
+                # Priority sampling specific metrics: priority configuration
                 if "strategy_priority_metric" in buffer_stats:
                     wandb_metrics["buffer/priority_metric"] = buffer_stats["strategy_priority_metric"]
                     wandb_metrics["buffer/priority_weight"] = buffer_stats["strategy_priority_weight"]
@@ -206,29 +200,20 @@ class RolloutManager:
                     if buffer_stats.get("strategy_normalization_method"):
                         wandb_metrics["buffer/normalization_method"] = buffer_stats["strategy_normalization_method"]
 
-                # 2. 强制打印到控制台 (Stdout Log)
-                # 这样即使在 Offline 模式或未启用 WandB 时，你也能在日志文件中看到这些数据
+                # 2. Log to console for debugging
                 print(f"[Buffer] Added {len(data)} samples.")
                 print(f"[Buffer Metrics] {wandb_metrics}")
 
-                # 3. 安全地记录到 WandB
-                # 只要 wandb 被初始化（无论是 online 还是 offline 模式），run 都不为 None
+                # 3. Log to WandB if initialized
                 if wandb.run is not None:
                     wandb.log(wandb_metrics)
-                # ================= 修复结束 =================
 
-            # === Step 4: Sample data for training (mixes buffer + new data automatically) ===
-            # 🔧 IMPORTANT: Use get_training_samples() for training to avoid getting incomplete prompts
-            # get_training_samples() ONLY returns complete samples from buffer, no fallback to dataset
-            # get_samples() is used for rollout generation and may return PENDING prompts
-
-            train_batch_samples = None  # Track training batch samples for metrics logging
+            # Step 4: Sample data for training (automatic buffer/new data mixing)
+            # Use get_training_samples() for training to ensure complete samples
+            train_batch_samples = None
 
             if hasattr(self.data_source, 'get_training_samples') and self.data_source.buffer_enabled:
-                # === FIX 4: Calculate correct sample count for off-policy mode ===
-                # In off-policy mode, we need to sample enough groups to satisfy global_batch_size
-                # num_samples is in GROUPS (not individual samples)
-                # Each group has n_samples_per_prompt samples
+                # Calculate correct sample count for off-policy mode
                 import math
                 num_groups_needed = math.ceil(self.args.global_batch_size / self.args.n_samples_per_prompt)
 
@@ -254,7 +239,7 @@ class RolloutManager:
                     num_samples=self.args.rollout_batch_size
                 )
 
-            # 🔧 DEFENSIVE CHECK: Verify buffer samples are complete
+            # Defensive check: verify buffer samples are complete
             if self.data_source.buffer_enabled and len(train_data_samples) > 0:
                 incomplete_groups = []
                 for i, group in enumerate(train_data_samples):
@@ -276,8 +261,7 @@ class RolloutManager:
                         f"This indicates buffer contamination. Check buffer filtering logic."
                     )
 
-            # === Step 5: Flatten grouped samples for _convert_samples_to_train_data ===
-            # _convert_samples_to_train_data expects list[Sample], not list[list[Sample]]
+            # Step 5: Flatten grouped samples for conversion
             if len(train_data_samples) > 0 and isinstance(train_data_samples[0], list):
                 # Flatten: list[list[Sample]] -> list[Sample]
                 flattened_samples = []
@@ -288,10 +272,7 @@ class RolloutManager:
             # Store for metrics logging before trimming
             train_batch_samples = train_data_samples.copy() if train_data_samples else []
 
-            # === FIX 5: Trim training data to exact global_batch_size ===
-            # In off-policy mode, we might sample slightly more than global_batch_size
-            # (due to rounding up to complete groups). Trim to exact size to ensure
-            # get_data_iterator assertions pass.
+            # Trim training data to exact global_batch_size if needed
             if self.data_source.buffer_enabled and len(train_data_samples) > self.args.global_batch_size:
                 original_len = len(train_data_samples)
                 train_data_samples = train_data_samples[:self.args.global_batch_size]
@@ -304,9 +285,8 @@ class RolloutManager:
                       f"This may cause training issues.")
 
 
-            # === Step 6: Validate training data before conversion ===
-            # CRITICAL: Verify all samples have valid rewards and responses
-            # If validation fails, we should NOT proceed with training as it indicates a bug
+            # Step 6: Validate training data before conversion
+            # Verify all samples have valid rewards and responses
             validation_errors = []
 
             # Check for None rewards
@@ -340,7 +320,7 @@ class RolloutManager:
                 print(f"{'='*80}")
 
                 # Log first few invalid samples for debugging
-                print(f"[DEBUG] First 5 invalid samples:")
+                print(f"First 5 invalid samples:")
                 for i, sample in enumerate(train_data_samples[:10]):
                     if sample.reward is None or sample.response_length == 0:
                         print(f"  Sample {i}:")
@@ -363,13 +343,11 @@ class RolloutManager:
 
             train_data = self._convert_samples_to_train_data(train_data_samples)
 
-            # === NEW: Log training batch metrics ===
-            # Log metrics for the samples actually used for training
-            # This is DIFFERENT from rollout metrics (which are for newly generated samples)
+            # Log training batch metrics (different from rollout metrics)
             if train_batch_samples and len(train_batch_samples) > 0:
                 _log_train_batch_metrics(rollout_id, self.args, train_batch_samples)
 
-            # === Step 7: Record generated batch in staleness controller ===
+            # Step 7: Record generated batch in staleness controller
             if self.staleness_controller is not None:
                 num_samples = len(train_data["tokens"])
                 self.staleness_controller.on_generation_completed(num_samples)
@@ -583,7 +561,7 @@ class RolloutManager:
                 print(f"{'='*80}\n")
 
                 # Log first few invalid samples
-                print(f"[DEBUG] First 5 invalid samples:")
+                print(f"First 5 invalid samples:")
                 for i, sample in enumerate(train_data_samples[:10]):
                     if sample.reward is None or sample.response_length == 0:
                         print(f"  Sample {i}: response_length={sample.response_length}, reward={sample.reward}")
@@ -658,10 +636,7 @@ class RolloutManager:
             while isinstance(data[0], list):
                 data = sum(data, [])
 
-            # === FIX 1: Skip trim in off-policy buffer mode ===
-            # In off-policy mode, rollout generates partial batches that go to buffer
-            # Training samples from buffer to reach global_batch_size
-            # Only trim in on-policy mode where rollout data is used directly for training
+            # Skip trim in off-policy buffer mode (use buffer for training)
             buffer_enabled = hasattr(self.data_source, 'buffer_enabled') and self.data_source.buffer_enabled
 
             if not buffer_enabled and len(data) % self.args.global_batch_size != 0:
@@ -675,11 +650,8 @@ class RolloutManager:
                       f"n_samples_per_prompt={self.args.n_samples_per_prompt}). "
                       f"Training will sample {self.args.global_batch_size} from buffer.")
 
-        # === Tag samples with current policy version (ENHANCED) ===
-        # IMPORTANT: Only set policy_version for NEW samples (from dataset)
-        # For samples from buffer (re-generation), they already have policy_version
-        # and we should NOT overwrite it, otherwise we lose track of when they were generated
-
+        # Tag samples with current policy version
+        # Only set policy_version for NEW samples, not samples from buffer
         untagged_count = 0
         retagged_count = 0
         invalid_count = 0
@@ -719,8 +691,8 @@ class RolloutManager:
         """
         Called after training completes to increment policy version.
 
-        CRITICAL: This method must be called after EVERY training step to ensure
-        policy_version stays in sync with actual policy updates.
+        Must be called after EVERY training step to ensure policy_version
+        stays in sync with actual policy updates.
         """
         old_version = self.current_policy_version
         self.current_policy_version += 1
@@ -728,35 +700,27 @@ class RolloutManager:
 
         print(f"[Off-Policy Tracking] Policy version updated: {old_version} -> {new_version}")
 
-        # === Update data source policy version (MANDATORY) ===
-        # This MUST succeed to maintain consistency
+        # Update data source policy version (MANDATORY for consistency)
         if hasattr(self.data_source, 'update_policy_version'):
             self.data_source.update_policy_version(new_version)
 
-            # === VERIFICATION: Check if update succeeded ===
+            # Verify update succeeded
             if hasattr(self.data_source, 'current_policy_version'):
                 actual_version = self.data_source.current_policy_version
                 if actual_version != new_version:
-                    # CRITICAL ERROR: Version mismatch detected
                     raise RuntimeError(
                         f"[CRITICAL] Policy version sync failed! "
-                        f"RolloutManager.current_policy_version={new_version}, "
-                        f"DataSource.current_policy_version={actual_version}. "
-                        f"This will cause incorrect staleness calculation!"
+                        f"RolloutManager={new_version}, DataSource={actual_version}"
                     )
                 print(f"[Off-Policy Tracking] DataSource policy version verified: {actual_version}")
         else:
-            # CRITICAL WARNING: DataSource doesn't support policy version tracking
-            print(f"[WARNING] DataSource does not implement update_policy_version()! "
-                  f"Staleness-aware sampling will NOT work correctly. "
-                  f"Please ensure your DataSource class inherits from RolloutDataSourceWithBuffer.")
+            print(f"[WARNING] DataSource does not implement update_policy_version()!")
 
-        # === Update staleness controller ===
+        # Update staleness controller
         if self.staleness_controller is not None:
             self.staleness_controller.on_training_step()
             print(
-                f"[Staleness Control] Updated - num_generated={self.staleness_controller.num_generated}, "
-                f"policy_version={self.staleness_controller.current_policy_version}"
+                f"[Staleness Control] Updated - policy_version={self.staleness_controller.current_policy_version}"
             )
 
     def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
@@ -784,8 +748,7 @@ class RolloutManager:
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
 
-        # === ROBUST VALIDATION: Check for None rewards ===
-        # None rewards indicate a bug in reward computation - should not be silently ignored
+        # Robust validation: check for None rewards
         none_count = sum(1 for r in raw_rewards if r is None)
 
         if none_count > 0:
@@ -923,8 +886,7 @@ class RolloutManager:
         if "teacher_log_probs" in samples[0].__dict__:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
-        # === Add policy versions for off-policy tracking ===
-        # For off-policy GRPO, policy_version is CRITICAL and must always be present
+        # Add policy versions for off-policy tracking
         is_offpolicy_mode = hasattr(self.args, "loss_type") and self.args.loss_type == "decoupled_policy_loss"
 
         # Collect all policy versions, handling None values robustly
@@ -1181,16 +1143,13 @@ def _log_eval_rollout_data(rollout_id, args, data):
 
 def _log_train_batch_metrics(rollout_id, args, samples):
     """
-    Log metrics for the TRAINING BATCH samples (may include samples from buffer).
+    Log metrics for TRAINING BATCH samples (may include samples from buffer).
 
-    This is DIFFERENT from rollout metrics:
+    Different from rollout metrics:
     - Rollout metrics: newly generated samples from current policy
-    - Train batch metrics: samples used for training (may be from old policies in buffer)
+    - Train batch metrics: samples used for training (may be from old policies)
 
-    In off-policy mode, these metrics help monitor:
-    - Data staleness (how old are the training samples)
-    - Reward distribution of training data vs newly generated data
-    - Buffer sampling effectiveness
+    Helps monitor data staleness, reward distribution, and buffer sampling effectiveness.
     """
     if len(samples) == 0:
         return
@@ -1220,9 +1179,7 @@ def _log_train_batch_metrics(rollout_id, args, samples):
         # Keep only mean for response length
         log_dict["train_batch/response_len_mean"] = np.mean(response_lengths_array).item()
 
-    # === Format Reward Statistics ===
-    # CRITICAL FIX: Always try to extract format stats if metadata exists
-    # Don't gate this on enable_format_reward flag
+    # Format Reward Statistics: extract from metadata if available
     format_stats = {
         'valid_format': 0,
         'invalid_format': 0,
@@ -1276,7 +1233,7 @@ def _log_train_batch_metrics(rollout_id, args, samples):
         for reward_key, count in reward_distribution.items():
             log_dict[f"train_batch/format/{reward_key}_ratio"] = count / total_samples
 
-    # === Off-Policy Specific Metrics ===
+    # Off-Policy specific metrics
     if args.loss_type == "decoupled_policy_loss":
         # Policy version statistics
         policy_versions = []
@@ -1310,19 +1267,18 @@ def _log_train_batch_metrics(rollout_id, args, samples):
             # Keep only mean for reuse count
             log_dict["train_batch/reuse_count/mean"] = np.mean(reuse_counts_array).item()
 
-    # === Truncation and Repetition ===
+    # Truncation and Repetition
     log_dict["train_batch/truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     log_dict["train_batch/repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
 
-    # === Log to WandB ===
+    # Log to WandB
     if args.use_wandb:
         # Use train step for consistency with train/ metrics
         step = rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
         log_dict["train/step"] = step
         wandb.log(log_dict)
 
-    # === Print Summary ===
-    # Extract key metrics for console logging
+    # Print summary for console
     summary = {}
     if "train_batch/reward/mean" in log_dict:
         summary["reward_mean"] = round(log_dict["train_batch/reward/mean"], 4)
